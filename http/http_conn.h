@@ -25,6 +25,9 @@
 #include "../CGImysql/sql_connection_pool.h"
 #include "../timer/lst_timer.h"
 #include "../log/log.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
 
 class http_conn
 {
@@ -147,6 +150,10 @@ private:
     char sql_user[100];
     char sql_passwd[100];
     char sql_name[100];
+public:
+    SSL* m_ssl = nullptr;                     // 新增：TLS 句柄
+    bool m_is_websocket = false;              // 新增：是否已握手为 ws
+    void handle_websocket();                  // 新增
 };
 
 #endif

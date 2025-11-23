@@ -2,7 +2,10 @@
 
 #include <mysql/mysql.h>
 #include <fstream>
-
+#include "../websocket.h" 
+#include <memory>
+#include <unordered_map>
+extern std::unordered_map<int, std::shared_ptr<http_conn>> g_clients;
 //定义http响应的一些状态信息
 const char *ok_200_title = "OK";
 const char *error_400_title = "Bad Request";
@@ -343,29 +346,45 @@ http_conn::HTTP_CODE http_conn::process_read()
 {
     LINE_STATUS line_status = LINE_OK;
     HTTP_CODE ret = NO_REQUEST;
-    char *text = 0;
+    char* text = nullptr;
 
-    while ((m_check_state == CHECK_STATE_CONTENT && line_status == LINE_OK) || ((line_status = parse_line()) == LINE_OK))
+    while ((m_check_state == CHECK_STATE_CONTENT && line_status == LINE_OK) ||
+           ((line_status = parse_line()) == LINE_OK))
     {
         text = get_line();
         m_start_line = m_checked_idx;
-        LOG_INFO("%s", text);
+        LOG_INFO("Recv: %s", text);
+
         switch (m_check_state)
         {
         case CHECK_STATE_REQUESTLINE:
         {
             ret = parse_request_line(text);
-            if (ret == BAD_REQUEST)
-                return BAD_REQUEST;
+            if (ret == BAD_REQUEST) return BAD_REQUEST;
             break;
         }
         case CHECK_STATE_HEADER:
         {
             ret = parse_headers(text);
-            if (ret == BAD_REQUEST)
-                return BAD_REQUEST;
-            else if (ret == GET_REQUEST)
-            {
+            if (ret == BAD_REQUEST) return BAD_REQUEST;
+            if (ret == GET_REQUEST) {
+                // 先检查是否是 WebSocket 握手请求
+                if (WebSocketFrame::is_websocket_handshake(m_read_buf)) {
+                    std::string key = get_header_value("Sec-WebSocket-Key");
+                    if (key.empty()) return BAD_REQUEST;
+
+                    std::string response = WebSocketFrame::make_handshake_response(key);
+
+                    if (m_ssl) {
+                        SSL_write(m_ssl, response.c_str(), response.length());
+                    } else {
+                        writen(m_sockfd, (void*)response.c_str(), response.length());
+                    }
+
+                    m_is_websocket = true;
+                    LOG_INFO("WebSocket handshake success, fd=%d", m_sockfd);
+                    return GET_REQUEST;  // 直接返回，保持连接
+                }
                 return do_request();
             }
             break;
@@ -373,8 +392,17 @@ http_conn::HTTP_CODE http_conn::process_read()
         case CHECK_STATE_CONTENT:
         {
             ret = parse_content(text);
-            if (ret == GET_REQUEST)
+            if (ret == GET_REQUEST) {
+                if (m_is_websocket) {
+                    handle_websocket();
+                    // 内容已经处理完，继续等待下一帧
+                    if (m_checked_idx >= m_read_idx) {
+                        m_read_idx = m_checked_idx = 0;
+                    }
+                    return GET_REQUEST;
+                }
                 return do_request();
+            }
             line_status = LINE_OPEN;
             break;
         }
@@ -382,9 +410,9 @@ http_conn::HTTP_CODE http_conn::process_read()
             return INTERNAL_ERROR;
         }
     }
+
     return NO_REQUEST;
 }
-
 http_conn::HTTP_CODE http_conn::do_request()
 {
     strcpy(m_real_file, doc_root);
@@ -700,3 +728,45 @@ void http_conn::process()
     }
     modfd(m_epollfd, m_sockfd, EPOLLOUT, m_TRIGMode);
 }
+
+
+// ====================== WebSocket 支持开始 ======================
+
+   // 注意路径！如果你的 websocket.h 在根目录，就写这个
+// 如果你放到了 http/ 目录，就改成 #include "websocket.h"
+
+
+void http_conn::handle_websocket()
+{
+    if (!m_is_websocket) return;
+
+    // m_checked_idx 是当前已解析的位置
+    int remaining = m_read_idx - m_checked_idx;
+    if (remaining <= 0) return;
+
+    int payload_len = 0;
+    std::string payload = WebSocketFrame::decode_frame(
+        m_read_buf + m_checked_idx, remaining, payload_len);
+
+    if (payload_len > 0) {
+        // 简单广播：把消息发给所有 WebSocket 客户端
+        std::string response_frame = WebSocketFrame::make_text_frame("Echo: " + payload);
+
+        // 全局客户端列表（原项目就有）
+        extern std::unordered_map<int, std::shared_ptr<http_conn>> g_clients;
+        for (auto& pair : g_clients) {
+            auto client = pair.second;
+            if (client && client->m_is_websocket && client->m_sockfd != -1) {
+                if (client->m_ssl) {
+                    SSL_write(client->m_ssl, response_frame.c_str(), response_frame.length());
+                } else {
+                    writen(client->m_sockfd, (void*)response_frame.c_str(), response_frame.length());
+                }
+            }
+        }
+
+        m_checked_idx += payload_len;
+    }
+}
+
+// ====================== WebSocket 支持结束 ======================
